@@ -2299,13 +2299,11 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             logger.error("Cannot get transfer engine session or weight info.")
             return False
 
-        # Pull out the reserved sync-state section (manifest + metadata) so it
-        # does not interfere with the per-parameter lookups below.
-        remote_sync = None
-        if isinstance(seed_transfer_engine_weight_info, dict):
-            remote_sync = seed_transfer_engine_weight_info.pop(
-                REMOTE_SYNC_RESERVED_KEY, None
-            )
+        # Reserved sync-state section (manifest + metadata); None for legacy
+        # seeds. It is keyed by a reserved name that never collides with a
+        # parameter name, so the per-parameter lookups below are unaffected and
+        # we read it non-destructively with `.get()`.
+        remote_sync = seed_transfer_engine_weight_info.get(REMOTE_SYNC_RESERVED_KEY)
 
         # prepare local/remote RDMA keys
         seed_ptr_list = []
