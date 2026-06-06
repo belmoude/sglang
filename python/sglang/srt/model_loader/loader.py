@@ -42,6 +42,13 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     get_remote_instance_transfer_engine_info_per_rank,
     register_memory_region,
 )
+from sglang.srt.model_loader.remote_sync_state import (
+    REMOTE_SYNC_RESERVED_KEY,
+    apply_remote_sync_state,
+    maybe_apply_remote_sync_state,
+    nccl_recv_remote_sync_state,
+    payload_uses_sync_providers,
+)
 from sglang.srt.server_args import get_global_server_args
 
 # Try to import accelerate (optional dependency)
@@ -2256,9 +2263,18 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                     src=0,
                     group=client._model_update_group,
                 )
+
+            # Receive state outside `named_parameters()` and apply it. The seed
+            # always sends a payload (possibly empty); when it declares sync
+            # providers we apply the received derived state and skip the local
+            # `post_load_weights` fixup, otherwise we fall back to it.
+            payload, recv_buffers = nccl_recv_remote_sync_state(
+                model, client._model_update_group, device_config.device
+            )
             current_platform.synchronize()
 
-            _post_load_weights(model)
+            if not maybe_apply_remote_sync_state(model, payload, recv_buffers):
+                _post_load_weights(model)
         end_get_weights_tic = time.time()
         logger.debug(
             f"finish getting all weights from remote instance, time used: {(end_get_weights_tic - start_get_weights_tic):.4f}s"
@@ -2282,6 +2298,12 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         ):
             logger.error("Cannot get transfer engine session or weight info.")
             return False
+
+        # Reserved sync-state section (manifest + metadata); None for legacy
+        # seeds. It is keyed by a reserved name that never collides with a
+        # parameter name, so the per-parameter lookups below are unaffected and
+        # we read it non-destructively with `.get()`.
+        remote_sync = seed_transfer_engine_weight_info.get(REMOTE_SYNC_RESERVED_KEY)
 
         # prepare local/remote RDMA keys
         seed_ptr_list = []
@@ -2310,6 +2332,27 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             client_ptr_list.append(client_ptr)
             client_len_list.append(client_len)
 
+        # Allocate + register receive buffers for sync-state tensors (derived
+        # tensors outside named_parameters), and queue their RDMA reads.
+        recv_buffers = {}
+        device = next(model.parameters()).device
+        if remote_sync is not None:
+            for entry in remote_sync["manifest"]:
+                buf = torch.empty(
+                    entry["storage_nbytes"], dtype=torch.uint8, device=device
+                )
+                reg = transfer_engine.register_memory(buf.data_ptr(), buf.numel())
+                if reg != 0:
+                    logger.error(
+                        f"register memory failed for sync tensor {entry['name']}, "
+                        f"error: {reg}"
+                    )
+                    return False
+                recv_buffers[entry["name"]] = buf
+                seed_ptr_list.append(entry["seed_storage_ptr"])
+                client_ptr_list.append(buf.data_ptr())
+                client_len_list.append(entry["storage_nbytes"])
+
         # load weights from source instance through TransferEngine
         ret = transfer_engine.batch_transfer_sync_read(
             seed_transfer_engine_session_id,
@@ -2321,7 +2364,15 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             logger.error(f"batch transfer failed, error: {ret}")
             return False
 
-        _post_load_weights(model)
+        if remote_sync is not None and payload_uses_sync_providers(remote_sync):
+            apply_remote_sync_state(
+                model,
+                remote_sync["manifest"],
+                recv_buffers,
+                remote_sync["metadata"],
+            )
+        else:
+            _post_load_weights(model)
 
         return True
 

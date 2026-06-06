@@ -137,6 +137,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_loader.remote_sync_state import RemoteSyncStateMixin
 from sglang.srt.models.deepseek_common.attention_backend_handler import (
     AttentionBackendRegistry,
 )
@@ -1424,11 +1425,26 @@ class DeepseekV2MoE(nn.Module):
 
 class DeepseekV2AttentionMLA(
     nn.Module,
+    RemoteSyncStateMixin,
     DeepseekMHAForwardMixin,
     DeepseekMLAForwardMixin,
     DeepseekMLARocmForwardMixin,
     DeepseekMLACpuForwardMixin,
 ):
+    # Derived state produced by `post_load_weights` that lives outside
+    # `named_parameters()`. Synced verbatim to remote instances so the client
+    # does not have to re-run `post_load_weights` (which is order-sensitive
+    # w.r.t. `process_weights_after_loading`). `w_scale` is intentionally
+    # included even though it may be a plain float on some paths: the mixin
+    # routes it to the metadata channel when it is not a tensor.
+    _REMOTE_SYNC_ATTRS = (
+        "w_kc",
+        "w_vc",
+        "w_scale",
+        "w_scale_k",
+        "w_scale_v",
+        "use_deep_gemm_bmm",
+    )
 
     def __init__(
         self,

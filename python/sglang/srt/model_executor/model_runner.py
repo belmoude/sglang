@@ -1748,12 +1748,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         na = NetworkAddress(master_address, group_port)
         message = ""
         try:
+            from sglang.srt.model_loader.remote_sync_state import (
+                nccl_send_remote_sync_state,
+            )
+
             for _, weights in self.model.named_parameters():
                 torch.distributed.broadcast(
                     weights,
                     src=0,
                     group=send_group,
                 )
+            # Sync state that lives outside `named_parameters()` (derived
+            # tensors, module scalars, tensor-object flags). The client applies
+            # it instead of re-running `post_load_weights` locally.
+            nccl_send_remote_sync_state(
+                self.model,
+                send_group,
+                device=torch.device("cuda", self.gpu_id),
+            )
             success = True
             message = f"Succeeded to send weights through {na.to_host_port_str()} {group_name}."
         except Exception as e:

@@ -113,6 +113,38 @@ def register_memory_region(model, transfer_engine):
         return register_memory_region_v2(model, transfer_engine)
 
 
+def register_remote_sync_state(model, transfer_engine, weight_mr_dict):
+    """Register storages of sync-state tensors (derived tensors outside
+    ``named_parameters()``) for RDMA and embed the manifest + metadata into
+    ``weight_mr_dict`` under a reserved key, so the client can read and apply
+    them alongside the parameters."""
+    from sglang.srt.model_loader.remote_sync_state import (
+        REMOTE_SYNC_RESERVED_KEY,
+        collect_remote_sync_payload,
+    )
+
+    extra_tensors, payload = collect_remote_sync_payload(model)
+    manifest = []
+    for entry in payload["manifest"]:
+        tensor = extra_tensors[entry["name"]]
+        storage = tensor.untyped_storage()
+        ret = transfer_engine.register_memory(storage.data_ptr(), storage.nbytes())
+        if ret != 0:
+            raise RuntimeError(
+                f"register memory failed for sync-state tensor {entry['name']}, "
+                f"error: {ret}"
+            )
+        entry = dict(entry)
+        entry["seed_storage_ptr"] = storage.data_ptr()
+        manifest.append(entry)
+
+    weight_mr_dict[REMOTE_SYNC_RESERVED_KEY] = {
+        "manifest": manifest,
+        "metadata": payload["metadata"],
+    }
+    return weight_mr_dict
+
+
 def register_memory_region_v1(model, transfer_engine):
     start_tic = time.time()
 
@@ -130,6 +162,8 @@ def register_memory_region_v1(model, transfer_engine):
             weight.numel(),
             weight.element_size(),
         )
+
+    register_remote_sync_state(model, transfer_engine, weight_mr_dict)
 
     end_tic = time.time()
     logger.debug(f"Register memory region time: {(end_tic - start_tic):.4f}s")
@@ -188,6 +222,8 @@ def register_memory_region_v2(model, transfer_engine):
             raise RuntimeError(
                 f"register memory failed for weight block at address {address} with size {size}, error: {ret}"
             )
+
+    register_remote_sync_state(model, transfer_engine, weight_mr_dict)
 
     end_tic = time.time()
     logger.debug(f"Register memory region v2 time: {(end_tic - start_tic):.4f}s")
